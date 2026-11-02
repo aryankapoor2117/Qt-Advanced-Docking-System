@@ -34,6 +34,30 @@ class PersistentPanelHostTest : public QObject
         QCOMPARE(QRect(area->mapFromGlobal(dock->mapToGlobal(QPoint())), dock->size()), area->contentAreaGeometry());
     }
 private slots:
+    void rootReplacementKeepsReusedSplittersPaintEnabled()
+    {
+        CDockManager manager;
+        manager.setPersistentDockWidgetHostsEnabled(true);
+        manager.setPreparedLayoutsEnabled(true);
+        auto *a = new CDockWidget("A"), *b = new CDockWidget("B"), *timeline = new CDockWidget("Timeline");
+        for (auto *dock : {a, b, timeline}) dock->setWidget(new QLineEdit(dock->windowTitle()));
+        auto *left = manager.addDockWidget(LeftDockWidgetArea, a);
+        manager.addDockWidget(RightDockWidgetArea, b, left);
+        auto *oldRoot = manager.activeRootSplitter();
+        QVERIFY(oldRoot->updatesEnabled());
+        manager.addDockWidget(BottomDockWidgetArea, timeline);
+        QVERIFY(manager.activeRootSplitter() != oldRoot);
+        QVERIFY(manager.activeRootSplitter()->isAncestorOf(oldRoot));
+        QVERIFY2(oldRoot->updatesEnabled(), "A former root reused inside the active tree must be able to paint");
+        manager.resize(1200, 800);
+        manager.show();
+        settle();
+        for (auto *dock : {a, b, timeline}) {
+            for (QWidget *widget = dock->dockAreaWidget(); widget && widget != &manager; widget = widget->parentWidget())
+                QVERIFY(widget->updatesEnabled());
+        }
+    }
+
     void restoreBeforeFirstShowKeepsBodiesAboveDockTree()
     {
         CDockManager manager;

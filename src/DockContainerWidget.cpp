@@ -152,6 +152,10 @@ public:
     QLayoutItem *replaceRootWidget(QWidget *before, QWidget *after) {
         if (!PreparedCanvas) return Layout->replaceWidget(before, after);
         PreparedCanvas->activate(static_cast<CDockSplitter*>(after));
+        // Live-tree root replacement can reuse the former root as a child.
+        // Unlike parking a cached layout, it must not remain explicitly
+        // paint-disabled when inserted into the new active splitter tree.
+        if (before) before->setUpdatesEnabled(true);
         return nullptr;
     }
 
