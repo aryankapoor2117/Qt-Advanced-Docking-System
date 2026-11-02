@@ -44,8 +44,14 @@ private slots:
         auto *left = manager.addDockWidget(LeftDockWidgetArea, a);
         manager.addDockWidget(RightDockWidgetArea, b, left);
         auto *oldRoot = manager.activeRootSplitter();
+        manager.resize(1200, 800);
+        manager.show();
+        settle();
+        const QSize viewport = oldRoot->size();
+        timeline->setFixedHeight(24);
         QVERIFY(oldRoot->updatesEnabled());
         manager.addDockWidget(BottomDockWidgetArea, timeline);
+        QCOMPARE(manager.activeRootSplitter()->size(), viewport);
         QVERIFY(manager.activeRootSplitter() != oldRoot);
         QVERIFY(manager.activeRootSplitter()->isAncestorOf(oldRoot));
         QVERIFY2(oldRoot->updatesEnabled(), "A former root reused inside the active tree must be able to paint");

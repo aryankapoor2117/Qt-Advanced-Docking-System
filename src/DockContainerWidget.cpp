@@ -535,6 +535,7 @@ void DockContainerWidgetPrivate::dropIntoContainer(CFloatingDockContainer* Float
     }
 
 	RootSplitter = Splitter;
+    if (PreparedCanvas) PreparedCanvas->activate(RootSplitter);
 	addDockAreasToList(NewDockAreas);
 
 	// If we dropped the floating widget into the main dock container that does
@@ -1469,6 +1470,7 @@ void DockContainerWidgetPrivate::addDockArea(CDockAreaWidget* NewDockArea, DockW
             delete li;
 		}
 		RootSplitter = NewSplitter;
+        if (PreparedCanvas) PreparedCanvas->activate(RootSplitter);
 	}
 
 	addDockAreasToList({NewDockArea});
