@@ -1,3 +1,4 @@
+#include "PersistentDockAreaContent.h"
 /*******************************************************************************
 ** Qt Advanced Docking System
 ** Copyright (C) 2017 Uwe Kindler
@@ -83,6 +84,7 @@ private:
 	QList<QPointer<QWidget>> m_Widgets;
 	int m_CurrentIndex = -1;
 	QWidget* m_CurrentWidget = nullptr;
+    CPersistentDockAreaContent* m_PersistentContent = nullptr;
 
 	/**
 	 * Detaches a widget without turning an existing native window into a top-level window.
@@ -106,9 +108,18 @@ public:
 	 */
 	CDockAreaLayout(QBoxLayout* ParentLayout)
 		: m_ParentLayout(ParentLayout)
-	{
+    {
+        auto *area = qobject_cast<CDockAreaWidget*>(ParentLayout->parentWidget());
+        if (area && area->dockManager()->persistentDockWidgetHostsEnabled()) {
+            m_PersistentContent = new CPersistentDockAreaContent(area);
+            m_ParentLayout->insertWidget(1, m_PersistentContent, 1);
+        }
+    }
 
-	}
+    void syncPersistentContent()
+    {
+        if (m_PersistentContent) m_PersistentContent->sync();
+    }
 
 	/**
 	 * Returns the number of widgets in this layout
@@ -124,7 +135,8 @@ public:
 	 */
 	void insertWidget(int index, QWidget* Widget)
 	{
-		detachWidget(Widget);
+		if (m_PersistentContent) Widget->hide();
+        else detachWidget(Widget);
 		if (index < 0)
 		{
 			index = m_Widgets.count();
@@ -150,12 +162,13 @@ public:
 	{
 		if (currentWidget() == Widget)
 		{
-			auto LayoutItem = m_ParentLayout->takeAt(1);
-			if (LayoutItem)
-			{
-				detachWidget(LayoutItem->widget());
-			}
-			delete LayoutItem;
+            if (m_PersistentContent) {
+                m_PersistentContent->setDockWidget(nullptr);
+            } else {
+                auto *item = m_ParentLayout->takeAt(1);
+                if (item) detachWidget(item->widget());
+                delete item;
+            }
 			m_CurrentWidget = nullptr;
 			m_CurrentIndex = -1;
 		}
@@ -205,6 +218,14 @@ public:
 		{
 			return;
 		}
+
+        if (m_PersistentContent) {
+            if (prev && prev != next) prev->hide();
+            m_CurrentIndex = index;
+            m_CurrentWidget = next;
+            m_PersistentContent->setDockWidget(qobject_cast<CDockWidget*>(next));
+            return;
+        }
 
 		bool reenableUpdates = false;
 		QWidget *parent = m_ParentLayout->parentWidget();
@@ -277,7 +298,8 @@ public:
 	 */
 	QRect geometry() const
 	{
-		return m_Widgets.empty() ? QRect() : currentWidget()->geometry();
+		return m_PersistentContent ? m_PersistentContent->geometry()
+            : (currentWidget() ? currentWidget()->geometry() : QRect());
 	}
 };
 
@@ -528,6 +550,12 @@ CDockManager* CDockAreaWidget::dockManager() const
 CDockContainerWidget* CDockAreaWidget::dockContainer() const
 {
 	return internal::findParent<CDockContainerWidget*>(this);
+}
+
+void CDockAreaWidget::refreshPersistentContent()
+{
+    d->Layout->activate();
+    d->ContentsLayout->syncPersistentContent();
 }
 
 //============================================================================

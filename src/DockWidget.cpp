@@ -845,7 +845,12 @@ void CDockWidget::setDockArea(CDockAreaWidget* DockArea)
 {
 	d->DockArea = DockArea;
 	d->ToggleViewAction->setChecked(DockArea != nullptr && !this->isClosed());
-	setParent(DockArea);
+    QWidget *host = DockArea;
+    if (d->DockManager && d->DockManager->persistentDockWidgetHostsEnabled())
+        host = DockArea && DockArea->dockContainer()
+            ? static_cast<QWidget*>(DockArea->dockContainer())
+            : static_cast<QWidget*>(d->DockManager);
+    if (parentWidget() != host) setParent(host);
 }
 
 

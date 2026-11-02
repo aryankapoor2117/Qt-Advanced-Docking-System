@@ -392,6 +392,11 @@ public:
 	 */
 	CDockManager(QWidget* parent = nullptr);
 
+    // Keep live panel surfaces under their native container during restores.
+    // Enable before creating dock areas. This does not cache layout trees.
+    void setPersistentDockWidgetHostsEnabled(bool enabled);
+    bool persistentDockWidgetHostsEnabled() const;
+
 	/**
 	 * Virtual Destructor
 	 */

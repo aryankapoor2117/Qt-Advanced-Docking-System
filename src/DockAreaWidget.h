@@ -211,6 +211,8 @@ public:
 	 */
 	CDockManager* dockManager() const;
 
+    void refreshPersistentContent();
+
 	/**
 	 * Returns the dock container widget this dock area widget belongs to or 0
 	 * if there is no

@@ -54,6 +54,7 @@
 #include <QAction>
 #include <QXmlStreamWriter>
 #include <QSettings>
+#include <QLayout>
 #include <QMenu>
 #include <QApplication>
 #include <QWindow>
@@ -138,6 +139,7 @@ struct DockManagerPrivate
 	CDockManager::eViewMenuInsertionOrder MenuInsertionOrder = CDockManager::MenuAlphabeticallySorted;
     CDockManager::ColorSchemeMode ColorSchemeMode = CDockManager::ColorSchemeMode::FollowPalette;
 	bool RestoringState = false;
+    bool PersistentDockWidgetHosts = false;
 	QVector<CFloatingDockContainer*> UninitializedFloatingWidgets;
 	CDockFocusController* FocusController = nullptr;
 	QString RestoredFocusedDockWidget;
@@ -980,6 +982,17 @@ QByteArray CDockManager::saveState(int version) const
 
 
 //============================================================================
+void CDockManager::setPersistentDockWidgetHostsEnabled(bool enabled)
+{
+    Q_ASSERT_X(dockAreaCount() == 0, Q_FUNC_INFO, "Enable persistent hosts before creating dock areas");
+    if (dockAreaCount() == 0) d->PersistentDockWidgetHosts = enabled;
+}
+
+bool CDockManager::persistentDockWidgetHostsEnabled() const
+{
+    return d->PersistentDockWidgetHosts;
+}
+
 bool CDockManager::restoreState(const QByteArray &state, int version)
 {
 	// Prevent multiple calls as long as state is not restore. This may
@@ -998,18 +1011,25 @@ bool CDockManager::restoreState(const QByteArray &state, int version)
 	// events until this function is finished, the user will not see this
 	// hiding
 	bool IsHidden = this->isHidden();
-	if (!IsHidden)
-	{
-		hide();
-	}
+    const bool updates = updatesEnabled();
+    if (d->PersistentDockWidgetHosts) {
+        if (updates) setUpdatesEnabled(false);
+    } else if (!IsHidden) {
+        hide();
+    }
 	d->RestoringState = true;
 	Q_EMIT restoringState();
 	bool Result = d->restoreState(state, version);
 	d->RestoringState = false;
-	if (!IsHidden)
-	{
-		show();
-	}
+    if (d->PersistentDockWidgetHosts) {
+        layout()->activate();
+        for (auto *container : d->Containers)
+            for (int i = 0; i < container->dockAreaCount(); ++i)
+                container->dockArea(i)->refreshPersistentContent();
+        if (updates) setUpdatesEnabled(true);
+    } else if (!IsHidden) {
+        show();
+    }
 	Q_EMIT stateRestored();
 	if (Result && !d->RestoredFocusedDockWidget.isEmpty())
 	{
