@@ -2316,8 +2316,10 @@ std::shared_ptr<PreparedNode> readPreparedNode(CDockingStateReader &xml, CDockMa
         const int expected = attributes.value("Count").toInt();
         while (xml.readNextStartElement()) {
             if (xml.name() == QLatin1String("Sizes")) {
-                for (const auto &size : xml.readElementText().split(QLatin1Char(' '), Qt::SkipEmptyParts))
-                    node->sizes.append(size.toInt());
+                for (const auto &size : xml.readElementText().split(QLatin1Char(' '))) {
+                    if (!size.isEmpty())
+                        node->sizes.append(size.toInt());
+                }
             } else {
                 auto child = readPreparedNode(xml, manager, seen);
                 if (!child) return {};
