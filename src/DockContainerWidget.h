@@ -31,6 +31,7 @@
 //                                   INCLUDES
 //============================================================================
 #include <QFrame>
+#include <memory>
 
 #include "ads_globals.h"
 #include "AutoHideTab.h"
@@ -46,6 +47,7 @@ class CDockAreaWidget;
 class CDockWidget;
 class CDockManager;
 struct DockManagerPrivate;
+struct PreparedDockLayout;
 class CFloatingDockContainer;
 struct FloatingDockContainerPrivate;
 class CFloatingDragPreview;
@@ -164,7 +166,13 @@ protected:
 	/**
 	 * Access function for the internal root splitter
 	 */
-	CDockSplitter* rootSplitter() const;
+    std::shared_ptr<PreparedDockLayout> capturePreparedLayout() const;
+    std::shared_ptr<PreparedDockLayout> compilePreparedLayout(const QByteArray &xml);
+    void detachPreparedLayout();
+    void enablePreparedLayoutStack();
+    bool activatePreparedLayout(const PreparedDockLayout &layout);
+    bool activatePreparedBounds(const PreparedDockLayout &layout);
+    CDockSplitter* rootSplitter() const;
 
 	/**
 	 * Creates and initializes a dockwidget auto hide container into the given area.
@@ -280,6 +288,7 @@ protected:
     void handleAutoHideWidgetEvent(QEvent* e, QWidget* w);
 
 public:
+    CDockSplitter *activeRootSplitter() const { return rootSplitter(); }
 	/**
 	 * Default Constructor
 	 */

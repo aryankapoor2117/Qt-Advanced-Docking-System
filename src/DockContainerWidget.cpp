@@ -1,3 +1,6 @@
+#include "LayoutSwitchTrace.h"
+#include "PreparedDockLayout.h"
+#include "PreparedLayoutCanvas.h"
 /*******************************************************************************
 ** Qt Advanced Docking System
 ** Copyright (C) 2017 Uwe Kindler
@@ -146,7 +149,16 @@ public:
 	QList<CAutoHideDockContainer*> AutoHideWidgets;
 	QMap<SideBarLocation, CAutoHideSideBar*> SideTabBarWidgets;
 	QGridLayout* Layout = nullptr;
-	CDockSplitter* RootSplitter = nullptr;
+    QLayoutItem *replaceRootWidget(QWidget *before, QWidget *after) {
+        if (!PreparedCanvas) return Layout->replaceWidget(before, after);
+        PreparedCanvas->activate(static_cast<CDockSplitter*>(after));
+        return nullptr;
+    }
+
+    CDockSplitter* RootSplitter = nullptr;
+    CPreparedLayoutCanvas *PreparedCanvas = nullptr;
+    QList<QPointer<CDockSplitter>> RestoreSplitterPool;
+    QList<QPointer<CDockSplitter>> RestoredSplitters;
 	bool isFloating = false;
 	CDockAreaWidget* LastAddedAreaCache[5];
 	int VisibleDockAreaCount = -1;
@@ -490,7 +502,7 @@ void DockContainerWidgetPrivate::dropIntoContainer(CFloatingDockContainer* Float
 	else if (Splitter->orientation() != InsertParam.orientation())
 	{
 		auto NewSplitter = newSplitter(InsertParam.orientation());
-		QLayoutItem* li = Layout->replaceWidget(Splitter, NewSplitter);
+		QLayoutItem* li = replaceRootWidget(Splitter, NewSplitter);
 		NewSplitter->addWidget(Splitter);
         updateSplitterHandles(NewSplitter);
         Splitter = NewSplitter;
@@ -1134,6 +1146,7 @@ void DockContainerWidgetPrivate::saveAutoHideWidgetsState(QXmlStreamWriter& s)
 bool DockContainerWidgetPrivate::restoreSplitter(CDockingStateReader& s,
 	QWidget*& CreatedWidget, bool Testing)
 {
+    const layout_trace::Span trace(Testing ? "qtads.restore_splitter.validate" : "qtads.restore_splitter");
 	bool Ok;
 	QString OrientationStr = s.attributes().value("Orientation").toString();
 
@@ -1163,12 +1176,23 @@ bool DockContainerWidgetPrivate::restoreSplitter(CDockingStateReader& s,
     ADS_PRINT("Restore NodeSplitter Orientation: " <<  Orientation <<
             " WidgetCount: " << WidgetCount);
 	QSplitter* Splitter = nullptr;
+    bool ReusingSplitter = false;
 	if (!Testing)
 	{
-		Splitter = newSplitter(static_cast<Qt::Orientation>(Orientation));
+        // Reconcile in preorder: ancestors are reserved before descendants,
+        // so transferring a reused branch cannot introduce a parent cycle.
+        if (!RestoreSplitterPool.isEmpty()) {
+            Splitter = RestoreSplitterPool.takeFirst();
+            ReusingSplitter = true;
+            layout_trace::timed("qtads.splitter.set_orientation", [&] { Splitter->setOrientation(static_cast<Qt::Orientation>(Orientation)); });
+        } else {
+            Splitter = layout_trace::timed("qtads.splitter.create", [&] { return newSplitter(static_cast<Qt::Orientation>(Orientation), _this); });
+        }
+        RestoredSplitters.append(qobject_cast<CDockSplitter*>(Splitter));
 	}
 	bool Visible = false;
 	QList<int> Sizes;
+    int RestoredChildCount = 0;
 	while (s.readNextStartElement())
 	{
 		QWidget* ChildNode = nullptr;
@@ -1210,12 +1234,23 @@ bool DockContainerWidgetPrivate::restoreSplitter(CDockingStateReader& s,
 
         ADS_PRINT("ChildNode isVisible " << ChildNode->isVisible()
             << " isVisibleTo " << ChildNode->isVisibleTo(Splitter));
-		Splitter->addWidget(ChildNode);
-		Visible |= ChildNode->isVisibleTo(Splitter);
+        if (Splitter->widget(RestoredChildCount) != ChildNode)
+            layout_trace::timed("qtads.splitter.insert_child", [&] { Splitter->insertWidget(RestoredChildCount, ChildNode); });
+        ++RestoredChildCount;
+        Visible |= ChildNode->isVisibleTo(Splitter);
 	}
     if(!Testing)
     {
-       updateSplitterHandles(Splitter);
+        // Park obsolete children under the same native window. Later nodes
+        // may still reuse them; cleanup happens after the complete restore.
+        while (Splitter->count() > RestoredChildCount) {
+            auto *Unused = Splitter->widget(RestoredChildCount);
+            layout_trace::timed("qtads.splitter.park_unused_child", [&] {
+                Unused->hide();
+                Unused->setParent(_this);
+            });
+        }
+        updateSplitterHandles(Splitter);
     }
 
 	if (Sizes.count() != WidgetCount)
@@ -1227,13 +1262,15 @@ bool DockContainerWidgetPrivate::restoreSplitter(CDockingStateReader& s,
 	{
 		if (!Splitter->count())
 		{
-			delete Splitter;
-			Splitter = nullptr;
+            RestoredSplitters.removeAll(qobject_cast<CDockSplitter*>(Splitter));
+            if (!ReusingSplitter)
+                delete Splitter;
+            Splitter = nullptr;
 		}
 		else
 		{
-			Splitter->setSizes(Sizes);
-			Splitter->setVisible(Visible);
+			layout_trace::timed("qtads.splitter.set_sizes", [&] { Splitter->setSizes(Sizes); });
+            layout_trace::timed("qtads.splitter.set_visibility", [&] { Splitter->setVisible(Visible); });
 		}
 		CreatedWidget = Splitter;
 	}
@@ -1251,11 +1288,16 @@ bool DockContainerWidgetPrivate::restoreDockArea(CDockingStateReader& s,
 	QWidget*& CreatedWidget, bool Testing)
 {
 	CDockAreaWidget* DockArea = nullptr;
-	auto Result = CDockAreaWidget::restoreState(s, DockArea, Testing, _this);
-	if (Result && DockArea)
-	{
-		appendDockAreas({DockArea});
-	}
+    bool Reused = false;
+    auto Result = CDockAreaWidget::restoreState(s, DockArea, Testing, _this, &Reused);
+    if (Result && DockArea)
+    {
+        // Reused areas already have their container signal connections.
+        if (Reused)
+            DockAreas.append(DockArea);
+        else
+            appendDockAreas({DockArea});
+    }
 	CreatedWidget = DockArea;
 	return Result;
 }
@@ -1408,7 +1450,7 @@ void DockContainerWidgetPrivate::addDockArea(CDockAreaWidget* NewDockArea, DockW
 		auto NewSplitter = newSplitter(InsertParam.orientation());
 		if (InsertParam.append())
 		{
-			QLayoutItem* li = Layout->replaceWidget(Splitter, NewSplitter);
+			QLayoutItem* li = replaceRootWidget(Splitter, NewSplitter);
 			NewSplitter->addWidget(Splitter);
 			NewSplitter->addWidget(NewDockArea);
             updateSplitterHandles(NewSplitter);
@@ -1417,7 +1459,7 @@ void DockContainerWidgetPrivate::addDockArea(CDockAreaWidget* NewDockArea, DockW
 		else
 		{
 			NewSplitter->addWidget(NewDockArea);
-			QLayoutItem* li = Layout->replaceWidget(Splitter, NewSplitter);
+			QLayoutItem* li = replaceRootWidget(Splitter, NewSplitter);
 			NewSplitter->addWidget(Splitter);
             updateSplitterHandles(NewSplitter);
             delete li;
@@ -1869,7 +1911,7 @@ void CDockContainerWidget::removeDockArea(CDockAreaWidget* area)
 
 		// We replace the superfluous RootSplitter with the ChildSplitter
 		ChildSplitter->setParent(nullptr);
-		QLayoutItem* li = d->Layout->replaceWidget(Splitter, ChildSplitter);
+		QLayoutItem* li = d->replaceRootWidget(Splitter, ChildSplitter);
 		d->RootSplitter = ChildSplitter;
 		delete li;
         ADS_PRINT("RootSplitter replaced by child splitter");
@@ -2146,13 +2188,28 @@ void CDockContainerWidget::saveState(QXmlStreamWriter& s) const
 //============================================================================
 bool CDockContainerWidget::restoreState(CDockingStateReader& s, bool Testing)
 {
+    const layout_trace::Span trace(Testing ? "qtads.restore_container.validate" : "qtads.restore_container");
 	bool IsFloating = s.attributes().value("Floating").toInt();
     ADS_PRINT("Restore CDockContainerWidget Floating" << IsFloating);
 
-	QWidget* NewRootSplitter {};
-	if (!Testing)
-	{
-		d->VisibleDockAreaCount = -1;// invalidate the dock area count
+    const auto PreviousAreas = d->DockAreas;
+    QList<QPointer<CDockSplitter>> PreviousSplitters;
+    QWidget* NewRootSplitter {};
+    if (!Testing)
+    {
+        const auto collect = [&](auto&& self, CDockSplitter* splitter) -> void {
+            PreviousSplitters.append(splitter);
+            for (int i = 0; i < splitter->count(); ++i)
+                if (auto *child = qobject_cast<CDockSplitter*>(splitter->widget(i)))
+                    self(self, child);
+        };
+        collect(collect, d->RootSplitter);
+        // Before first show there is no presented geometry to preserve.
+        // Fresh hidden splitters retain zero/uninitialized saved dimensions.
+        d->RestoreSplitterPool = isVisible()
+            ? PreviousSplitters : QList<QPointer<CDockSplitter>>{};
+        d->RestoredSplitters.clear();
+        d->VisibleDockAreaCount = -1;// invalidate the dock area count
 		d->DockAreas.clear();
 		std::fill(std::begin(d->LastAddedAreaCache),std::end(d->LastAddedAreaCache), nullptr);
 	}
@@ -2199,15 +2256,245 @@ bool CDockContainerWidget::restoreState(CDockingStateReader& s, bool Testing)
 		NewRootSplitter = d->newSplitter(Qt::Horizontal);
 	}
 
-	QLayoutItem* li = d->Layout->replaceWidget(d->RootSplitter, NewRootSplitter);
-	auto OldRoot = d->RootSplitter;
-	d->RootSplitter = qobject_cast<CDockSplitter*>(NewRootSplitter);
-	OldRoot->deleteLater();
-	delete li;
+    if (NewRootSplitter != d->RootSplitter) {
+        auto *item = d->replaceRootWidget(d->RootSplitter, NewRootSplitter);
+        d->RootSplitter = qobject_cast<CDockSplitter*>(NewRootSplitter);
+        delete item;
+    }
+    for (auto &area : PreviousAreas) {
+        if (!area || d->DockAreas.contains(area))
+            continue;
+        // Unmentioned panels remain registered and can be reopened later.
+        for (auto *dock : area->dockWidgets())
+            if (dock->dockAreaWidget() == area && !d->DockManager->hasRestoreDestination(dock))
+                dock->flagAsUnassigned();
+        area->hide();
+        area->setParent(this);
+        area->deleteLater();
+    }
+    for (auto &splitter : PreviousSplitters) {
+        if (splitter && !d->RestoredSplitters.contains(splitter)) {
+            splitter->hide();
+            splitter->setParent(this);
+            splitter->deleteLater();
+        }
+    }
+    d->RestoreSplitterPool.clear();
+    d->RestoredSplitters.clear();
 
 	return true;
 }
 
+
+//============================================================================
+namespace {
+struct PreparedNode {
+    bool splitter = false;
+    Qt::Orientation orientation = Qt::Horizontal;
+    QList<int> sizes;
+    QVector<std::shared_ptr<PreparedNode>> children;
+    QList<CDockWidget*> widgets;
+    QList<bool> closed;
+    int selected = -1;
+    DockWidgetAreas allowed = AllDockAreas;
+    CDockAreaWidget::DockAreaFlags flags{CDockAreaWidget::DefaultFlags};
+};
+std::shared_ptr<PreparedNode> readPreparedNode(CDockingStateReader &xml, CDockManager *manager, QSet<CDockWidget*> &seen)
+{
+    auto node = std::make_shared<PreparedNode>();
+    if (xml.name() == QLatin1String("Splitter")) {
+        node->splitter = true;
+        const auto attributes = xml.attributes();
+        const auto orientation = attributes.value("Orientation");
+        bool horizontal = orientation == QLatin1String("|");
+        if (xml.fileVersion() == 0) horizontal = !horizontal;
+        node->orientation = horizontal ? Qt::Horizontal : Qt::Vertical;
+        const int expected = attributes.value("Count").toInt();
+        while (xml.readNextStartElement()) {
+            if (xml.name() == QLatin1String("Sizes")) {
+                for (const auto &size : xml.readElementText().split(QLatin1Char(' '), Qt::SkipEmptyParts))
+                    node->sizes.append(size.toInt());
+            } else {
+                auto child = readPreparedNode(xml, manager, seen);
+                if (!child) return {};
+                node->children.append(child);
+            }
+        }
+        if (node->children.size() != expected || node->sizes.size() != expected) return {};
+    } else if (xml.name() == QLatin1String("Area")) {
+        const auto attributes = xml.attributes();
+        const auto current = attributes.value("Current").toString();
+        const auto allowed = attributes.value("AllowedAreas");
+        const auto flags = attributes.value("Flags");
+        if (!allowed.isEmpty()) node->allowed = DockWidgetAreas(allowed.toInt(nullptr,16));
+        if (!flags.isEmpty()) node->flags = CDockAreaWidget::DockAreaFlags(flags.toInt(nullptr,16));
+        while (xml.readNextStartElement()) {
+            if (xml.name() != QLatin1String("Widget")) return {};
+            auto *dock = manager->findDockWidget(xml.attributes().value("Name").toString());
+            if (!dock || seen.contains(dock)) return {};
+            seen.insert(dock); // Each panel has exactly one destination slot.
+            if (dock->objectName() == current) node->selected = node->widgets.size();
+            node->widgets.append(dock);
+            node->closed.append(xml.attributes().value("Closed").toInt() != 0);
+            xml.skipCurrentElement();
+        }
+        if (node->selected < 0 || node->closed[node->selected]) {
+            node->selected = -1;
+            for (int i = 0; i < node->closed.size(); ++i)
+                if (!node->closed[i]) { node->selected = i; break; }
+        }
+    } else return {};
+    return xml.hasError() ? std::shared_ptr<PreparedNode>{} : node;
+}
+} // namespace
+
+std::shared_ptr<PreparedDockLayout> CDockContainerWidget::compilePreparedLayout(const QByteArray &bytes)
+{
+    if (!d->PreparedCanvas) return {};
+    CDockingStateReader xml(bytes);
+    if (!xml.readNextStartElement() || xml.attributes().value("Containers").toInt() != 1) return {};
+    xml.setFileVersion(xml.attributes().value("Version").toInt());
+    if (!xml.readNextStartElement() || xml.name() != QLatin1String("Container")
+        || xml.attributes().value("Floating").toInt() != 0 || !xml.readNextStartElement()) return {};
+    QSet<CDockWidget*> seen;
+    auto plan = readPreparedNode(xml, dockManager(), seen);
+    if (!plan || !plan->splitter) return {};
+    // No sidebars/additional roots: those keep the existing restore path.
+    if (xml.readNextStartElement()) return {};
+    if (xml.hasError()) return {};
+    auto result = std::make_shared<PreparedDockLayout>();
+    QWidget staging(d->PreparedCanvas);
+    staging.hide();
+    std::function<QWidget*(const std::shared_ptr<PreparedNode>&, QWidget*)> build;
+    build = [&](const std::shared_ptr<PreparedNode> &node, QWidget *parent) -> QWidget* {
+        if (node->splitter) {
+            auto *splitter = d->newSplitter(node->orientation, parent);
+            for (const auto &child : node->children) splitter->addWidget(build(child, splitter));
+            result->sizes.append({splitter, node->sizes});
+            splitter->show();
+            return splitter;
+        }
+        auto *area = new CDockAreaWidget(dockManager(), this);
+        area->setParent(parent);
+        area->setAllowedAreas(node->allowed);
+        area->setDockAreaFlags(node->flags);
+        area->prepareDockWidgets(node->widgets, node->closed, node->selected);
+        PreparedDockArea group;
+        group.area = area; group.closed = node->closed; group.selected = node->selected;
+        for (auto *dock : node->widgets) group.widgets.append(dock);
+        result->areas.append(group);
+        QObject::connect(area, &CDockAreaWidget::viewToggled, this, [this, area](bool visible) {
+            if (d->DockAreas.contains(area)) d->onDockAreaViewToggled(visible);
+        });
+        return area;
+    };
+    result->root = static_cast<CDockSplitter*>(build(plan, &staging));
+    result->viewport = d->PreparedCanvas->size();
+    d->PreparedCanvas->prepare(result->root);
+    // Parent-first sizing after the destination viewport is known.
+    for (auto it = result->sizes.crbegin(); it != result->sizes.crend(); ++it)
+        it->first->setSizes(it->second);
+    const std::weak_ptr<PreparedDockLayout> weak = result;
+    for (const auto &entry : result->sizes)
+        result->geometryWatches.append(QObject::connect(entry.first, &QSplitter::splitterMoved,
+            entry.first, [weak] { if (auto state = weak.lock()) state->geometryEdited = true; }));
+    return result;
+}
+
+std::shared_ptr<PreparedDockLayout> CDockContainerWidget::capturePreparedLayout() const
+{
+    auto result = std::make_shared<PreparedDockLayout>();
+    result->root = d->RootSplitter;
+    result->viewport = size();
+    for (auto *splitter : d->RootSplitter->findChildren<CDockSplitter*>())
+        result->sizes.append({splitter, splitter->sizes()});
+    result->sizes.append({d->RootSplitter, d->RootSplitter->sizes()});
+    // A resize or deferred font/minimum adjustment is not a user layout edit.
+    // Only interactive handle movement invalidates the saved geometry.
+    const std::weak_ptr<PreparedDockLayout> weak = result;
+    for (const auto &entry : result->sizes)
+        result->geometryWatches.append(QObject::connect(entry.first, &QSplitter::splitterMoved,
+            entry.first, [weak] { if (auto state = weak.lock()) state->geometryEdited = true; }));
+    for (auto area : d->DockAreas) {
+        if (!area || area->isAutoHide()) return {};
+        PreparedDockArea group;
+        group.area = area;
+        group.selected = area->currentIndex();
+        for (auto *dock : area->dockWidgets()) {
+            group.widgets.append(dock);
+            group.closed.append(dock->isClosed());
+        }
+        result->areas.append(group);
+    }
+    return result;
+}
+
+void CDockContainerWidget::enablePreparedLayoutStack()
+{
+    if (d->PreparedCanvas) return;
+    d->PreparedCanvas = new CPreparedLayoutCanvas(this);
+    d->Layout->removeWidget(d->RootSplitter);
+    d->Layout->addWidget(d->PreparedCanvas, 1, 1);
+    d->PreparedCanvas->show();
+    d->Layout->activate();
+    d->PreparedCanvas->activate(d->RootSplitter);
+}
+
+void CDockContainerWidget::detachPreparedLayout()
+{
+    d->PreparedCanvas->park();
+    for (auto area : d->DockAreas)
+        if (area) area->detachPreparedTabs();
+    d->RootSplitter = nullptr;
+    d->DockAreas.clear();
+    d->VisibleDockAreaCount = -1;
+    d->TopLevelDockArea = nullptr;
+    std::fill(std::begin(d->LastAddedAreaCache), std::end(d->LastAddedAreaCache), nullptr);
+    createRootSplitter();
+}
+
+bool CDockContainerWidget::activatePreparedLayout(const PreparedDockLayout &state)
+{
+    if (!state.valid()) return false;
+    auto *empty = d->RootSplitter;
+    d->PreparedCanvas->activate(state.root);
+    d->RootSplitter = state.root;
+    empty->hide();
+    empty->deleteLater();
+    d->DockAreas.clear();
+    d->VisibleDockAreaCount = -1;
+    d->TopLevelDockArea = nullptr;
+    std::fill(std::begin(d->LastAddedAreaCache), std::end(d->LastAddedAreaCache), nullptr);
+    for (const auto &group : state.areas) {
+        d->DockAreas.append(group.area);
+        group.area->bindPreparedTabs(group.closed, group.selected);
+    }
+    // The retained tree already owns its final splitter geometry.
+    // Replaying setSizes here would schedule another layout pass.
+    d->RootSplitter->show();
+    for (const auto &group : state.areas) {
+        group.area->setVisible(group.area->indexOfFirstOpenDockWidget() >= 0);
+    }
+    return true;
+}
+
+bool CDockContainerWidget::activatePreparedBounds(const PreparedDockLayout &state)
+{
+    if (!state.valid() || !d->PreparedCanvas) return false;
+    for (auto area : d->DockAreas)
+        if (area) area->detachPreparedTabs();
+    d->RootSplitter = state.root;
+    d->DockAreas.clear();
+    d->VisibleDockAreaCount = -1;
+    d->TopLevelDockArea = nullptr;
+    std::fill(std::begin(d->LastAddedAreaCache), std::end(d->LastAddedAreaCache), nullptr);
+    d->PreparedCanvas->activate(state.root);
+    for (const auto &group : state.areas) {
+        d->DockAreas.append(group.area);
+        group.area->bindPreparedTabs(group.closed, group.selected);
+    }
+    return true;
+}
 
 //============================================================================
 CDockSplitter* CDockContainerWidget::rootSplitter() const
@@ -2224,7 +2511,9 @@ void CDockContainerWidget::createRootSplitter()
 		return;
 	}
 	d->RootSplitter = d->newSplitter(Qt::Horizontal);
-	d->Layout->addWidget(d->RootSplitter, 1, 1); // Add it to the center - the 0 and 2 indexes are used for the SideTabBar widgets
+    if (d->PreparedCanvas) {
+        d->PreparedCanvas->activate(d->RootSplitter);
+    } else d->Layout->addWidget(d->RootSplitter, 1, 1); // Add it to the center - the 0 and 2 indexes are used for the SideTabBar widgets
 }
 
 

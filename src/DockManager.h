@@ -103,6 +103,9 @@ private:
 	friend class DockContainerWidgetPrivate;
 	friend class CDockAreaTabBar;
 	friend class CDockWidgetTab;
+    friend class CDockAreaWidget;
+    // Only populated during an already validated restore, across all windows.
+    bool hasRestoreDestination(const CDockWidget* widget) const;
 	friend struct DockAreaWidgetPrivate;
 	friend struct DockWidgetTabPrivate;
 	friend class CFloatingDragPreview;
@@ -392,11 +395,6 @@ public:
 	 */
 	CDockManager(QWidget* parent = nullptr);
 
-    // Keep live panel surfaces under their native container during restores.
-    // Enable before creating dock areas. This does not cache layout trees.
-    void setPersistentDockWidgetHostsEnabled(bool enabled);
-    bool persistentDockWidgetHostsEnabled() const;
-
 	/**
 	 * Virtual Destructor
 	 */
@@ -528,6 +526,26 @@ public:
 	void setFloatingDropPreviewResizePredicate(
 		std::function<bool(CFloatingDockContainer*)> Predicate);
 
+    /**
+     * Keep dock contents under their native container while dock areas provide
+     * layout slots. Set before creating dock areas. Experimental, opt-in.
+     * Logical membership, tabs, splitters and serialization remain QtADS-owned.
+     */
+    void setPersistentDockWidgetHostsEnabled(bool enabled);
+    bool persistentDockWidgetHostsEnabled() const;
+    void setPreparedLayoutsEnabled(bool enabled);
+    bool preparedLayoutsEnabled() const;
+    bool lastRestoreUsedPreparedLayout() const;
+    bool lastRestoreUsedBoundsActivation() const;
+    // Activates retained chrome + shared surface bounds, or returns false
+    // without changing the live layout when preparation/reconciliation is needed.
+    bool activatePreparedState(const QByteArray &state, int version = 0);
+    bool prepareState(const QByteArray &state, int version = 0);
+    void retainPreparedStates(const QList<QByteArray> &states, int version = 0);
+    bool isStatePrepared(const QByteArray &state, int version = 0) const;
+    CDockSplitter *preparedRootForState(const QByteArray &state, int version = 0) const;
+    void clearPreparedLayouts();
+
 	/**
 	 * Sets the value for the given config parameter
 	 */
@@ -569,6 +587,11 @@ public:
 	 * \endcode
 	 * \return Returns the dock area widget that contains the new DockWidget
 	 */
+    /** Register a new unassigned dock for a forthcoming state restore.
+     * Avoids inserting a temporary area into the current splitter tree.
+     */
+    void registerDockWidget(CDockWidget* Dockwidget);
+
 	CDockAreaWidget* addDockWidget(DockWidgetArea area, CDockWidget* Dockwidget,
 		CDockAreaWidget* DockAreaWidget = nullptr, int Index = -1);
 

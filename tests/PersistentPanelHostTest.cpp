@@ -136,6 +136,194 @@ private slots:
         manager.show(); settle(); QVERIFY(b->isVisible()); verifyBounds(b);
     }
 
+    void preparedTreesActivateWithoutRebuildingAndInvalidateEdits()
+    {
+        CDockManager manager;
+        manager.setPersistentDockWidgetHostsEnabled(true);
+        manager.setPreparedLayoutsEnabled(true);
+        auto *a = new CDockWidget("A"), *b = new CDockWidget("B"), *c = new CDockWidget("C");
+        for (auto *dock : {a,b,c}) dock->setWidget(new QLineEdit(dock->windowTitle()));
+        auto *left = manager.addDockWidget(LeftDockWidgetArea, a);
+        manager.addDockWidget(CenterDockWidgetArea, b, left);
+        manager.addDockWidget(RightDockWidgetArea, c, left);
+        a->setAsCurrentTab();
+        const auto first = manager.saveState();
+        manager.addDockWidget(BottomDockWidgetArea, b, left);
+        manager.addDockWidget(CenterDockWidgetArea, c, b->dockAreaWidget());
+        c->setAsCurrentTab();
+        const auto second = manager.saveState();
+        manager.resize(1000,700); manager.show(); settle();
+        QList<QPointer<CDockAreaWidget>> firstAreas, secondAreas;
+        parentChanges = 0;
+        for (auto *dock : {a,b,c}) dock->installEventFilter(this);
+        for (int cycle = 0; cycle < 8; ++cycle) {
+            const bool firstLayout = cycle % 2 == 0;
+            QVERIFY(manager.restoreState(firstLayout ? first : second)); settle();
+            QCOMPARE(manager.lastRestoreUsedPreparedLayout(), cycle >= 2);
+            auto &areas = firstLayout ? firstAreas : secondAreas;
+            if (areas.isEmpty()) {
+                for (int i = 0; i < manager.dockAreaCount(); ++i) areas.append(manager.dockArea(i));
+            } else {
+                QCOMPARE(manager.dockAreaCount(), areas.size());
+                for (int i = 0; i < areas.size(); ++i) QCOMPARE(manager.dockArea(i), areas[i].data());
+            }
+            QCOMPARE(b->dockAreaWidget(), firstLayout ? a->dockAreaWidget() : c->dockAreaWidget());
+            QCOMPARE(b->dockAreaWidget()->currentDockWidget(), firstLayout ? a : c);
+            for (auto *dock : {a,b,c}) if (dock->isVisible()) verifyBounds(dock);
+            QCOMPARE(parentChanges, 0);
+        }
+        // Editing the active B layout must not overwrite the saved B snapshot.
+        manager.addDockWidget(RightDockWidgetArea, c, a->dockAreaWidget()); settle();
+        QVERIFY(manager.restoreState(first)); settle();
+        QVERIFY(manager.restoreState(second)); settle();
+        QVERIFY(!manager.lastRestoreUsedPreparedLayout());
+        QCOMPARE(b->dockAreaWidget(), c->dockAreaWidget());
+        auto *area = a->dockAreaWidget();
+        const auto before = manager.saveState();
+        QVERIFY(!manager.restoreState("not a layout")); settle();
+        QCOMPARE(a->dockAreaWidget(), area);
+        QCOMPARE(manager.saveState(), before);
+        for (auto *dock : {a,b,c}) dock->removeEventFilter(this);
+        manager.removeDockWidget(b);
+        delete b;
+        settle();
+        QVERIFY(manager.restoreState(first)); settle();
+        QVERIFY(!manager.lastRestoreUsedPreparedLayout());
+        QVERIFY(a->isVisible()); verifyBounds(a);
+    }
+
+    void boundsActivationKeepsChromeLiveAndSupportsImmediateInteraction()
+    {
+        CDockManager manager;
+        manager.setPersistentDockWidgetHostsEnabled(true);
+        manager.setPreparedLayoutsEnabled(true);
+        auto *a = new CDockWidget("A"), *b = new CDockWidget("B"), *c = new CDockWidget("C");
+        for (auto *dock : {a,b,c}) dock->setWidget(new QLineEdit(dock->windowTitle()));
+        auto *left = manager.addDockWidget(LeftDockWidgetArea, a);
+        manager.addDockWidget(CenterDockWidgetArea, b, left);
+        manager.addDockWidget(RightDockWidgetArea, c, left);
+        a->setAsCurrentTab();
+        manager.resize(1100,750); manager.show(); settle();
+        const auto first = manager.saveState();
+        manager.addDockWidget(BottomDockWidgetArea, b, c->dockAreaWidget());
+        manager.addDockWidget(CenterDockWidgetArea, a, b->dockAreaWidget());
+        b->setAsCurrentTab();
+        const auto second = manager.saveState();
+        QVERIFY(manager.restoreState(first)); settle();
+        auto *firstRoot = manager.activeRootSplitter();
+        QVERIFY(manager.restoreState(second)); settle();
+        auto *secondRoot = manager.activeRootSplitter();
+        QVERIFY(firstRoot != secondRoot);
+        struct ChromeEvents : QObject {
+            int hideShow = 0, reparent = 0, resize = 0;
+            bool eventFilter(QObject *, QEvent *event) override {
+                if (event->type() == QEvent::Show || event->type() == QEvent::Hide) ++hideShow;
+                if (event->type() == QEvent::ParentChange) ++reparent;
+                if (event->type() == QEvent::Resize) ++resize;
+                return false;
+            }
+        } events;
+        for (auto *root : {firstRoot, secondRoot}) {
+            root->installEventFilter(&events);
+            for (auto *area : root->findChildren<CDockAreaWidget*>()) area->installEventFilter(&events);
+        }
+        const auto activeConnection = connect(&manager, &CDockManager::restoringState, &manager, [&] {
+            QVERIFY(manager.updatesEnabled());
+        });
+        // No event-loop turn is needed between prepared activations. Geometry
+        // and hit testing are correct immediately; no hidden subtree is shown.
+        for (int cycle = 0; cycle < 8; ++cycle) {
+            QVERIFY(manager.activatePreparedState(cycle % 2 ? second : first));
+            QVERIFY(manager.updatesEnabled());
+            QCOMPARE(manager.activeRootSplitter(), cycle % 2 ? secondRoot : firstRoot);
+            QCOMPARE(firstRoot->updatesEnabled(), cycle % 2 == 0);
+            QCOMPARE(secondRoot->updatesEnabled(), cycle % 2 != 0);
+            for (auto *dock : {a,b,c}) {
+                QCOMPARE(dock->parentWidget(), &manager);
+                if (dock->isVisible()) {
+                    verifyBounds(dock);
+                    QVERIFY(manager.rect().contains(dock->geometry()));
+                    auto *hit = manager.childAt(dock->geometry().center());
+                    QVERIFY(hit == dock || dock->isAncestorOf(hit));
+                }
+            }
+        }
+        QCOMPARE(events.hideShow, 0);
+        QCOMPARE(events.reparent, 0);
+        QCOMPARE(events.resize, 0);
+        disconnect(activeConnection);
+        // Retained tabs are live controls, with only the active chrome onscreen.
+        a->setAsCurrentTab(); settle();
+        QVERIFY(a->isVisible()); QVERIFY(!b->isVisible()); verifyBounds(a);
+        auto *edit = qobject_cast<QLineEdit*>(a->widget());
+        QTest::keyClicks(edit, " retained");
+        QVERIFY(edit->text().endsWith(" retained"));
+        manager.resize(1300,850); settle(); verifyBounds(a);
+        // A changed outgoing selection does not make a prepared destination cold.
+        // Its edited chrome is discarded without rebuilding the target.
+        QVERIFY(manager.activatePreparedState(first));
+        QVERIFY(manager.restoreState(first)); settle(); verifyBounds(a);
+        manager.addDockWidget(RightDockWidgetArea, b, c->dockAreaWidget()); settle();
+        QCOMPARE(b->dockContainer(), &manager); QVERIFY(b->isVisible()); verifyBounds(b);
+    }
+
+    void offscreenPreparationDoesNotTouchLivePanelsAndFirstActivationUsesBounds()
+    {
+        CDockManager manager;
+        manager.setPersistentDockWidgetHostsEnabled(true);
+        manager.setPreparedLayoutsEnabled(true);
+        auto *a = new CDockWidget("A"), *b = new CDockWidget("B"), *c = new CDockWidget("C");
+        for (auto *dock : {a,b,c}) dock->setWidget(new QLineEdit(dock->windowTitle()));
+        auto *left = manager.addDockWidget(LeftDockWidgetArea, a);
+        manager.addDockWidget(CenterDockWidgetArea, b, left);
+        manager.addDockWidget(RightDockWidgetArea, c, left);
+        a->setAsCurrentTab();
+        manager.resize(1000,750); manager.show(); settle();
+        const auto first = manager.saveState();
+        manager.addDockWidget(BottomDockWidgetArea, b, c->dockAreaWidget());
+        manager.addDockWidget(CenterDockWidgetArea, a, b->dockAreaWidget());
+        b->setAsCurrentTab();
+        c->toggleView(false);
+        const auto second = manager.saveState();
+        QVERIFY(manager.restoreState(first)); settle();
+        const auto before = manager.saveState();
+        auto *root = manager.activeRootSplitter();
+        auto *area = a->dockAreaWidget();
+        auto *tab = a->tabWidget();
+        const auto bounds = a->geometry();
+        const auto visible = a->isVisible();
+        QSignalSpy restored(&manager, &CDockManager::stateRestored);
+        parentChanges = 0;
+        for (auto *dock : {a,b,c}) dock->installEventFilter(this);
+        QVERIFY(manager.prepareState(second));
+        QVERIFY(manager.isStatePrepared(second));
+        auto *preparedRoot = manager.preparedRootForState(second);
+        QVERIFY(preparedRoot);
+        QVERIFY(!preparedRoot->updatesEnabled());
+        settle();
+        QCOMPARE(restored.count(), 0);
+        QCOMPARE(manager.activeRootSplitter(), root);
+        QCOMPARE(manager.saveState(), before);
+        QCOMPARE(a->dockAreaWidget(), area);
+        QCOMPARE(a->tabWidget(), tab);
+        QCOMPARE(a->geometry(), bounds);
+        QCOMPARE(a->isVisible(), visible);
+        QCOMPARE(parentChanges, 0);
+        QVERIFY(!manager.prepareState("invalid"));
+        QCOMPARE(manager.saveState(), before);
+        QVERIFY(manager.restoreState(second));
+        QVERIFY(manager.lastRestoreUsedBoundsActivation());
+        QCOMPARE(manager.activeRootSplitter(), preparedRoot);
+        QVERIFY(preparedRoot->updatesEnabled());
+        QVERIFY(!root->updatesEnabled());
+        QCOMPARE(a->dockAreaWidget(), b->dockAreaWidget());
+        QCOMPARE(b->dockAreaWidget()->currentDockWidget(), b);
+        QVERIFY(b->isVisible()); QVERIFY(!a->isVisible()); QVERIFY(c->isClosed());
+        verifyBounds(b);
+        QCOMPARE(parentChanges, 0);
+        for (auto *dock : {a,b,c}) dock->removeEventFilter(this);
+    }
+
     void floatingAndReturningChangesHostOnce()
     {
         CDockManager manager;
