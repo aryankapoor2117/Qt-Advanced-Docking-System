@@ -394,20 +394,18 @@ bool DockManagerPrivate::restoreStateFromXml(const QByteArray &state,  int versi
 
     if (!Testing)
     {
-		// Delete remaining empty floating widgets
-		int FloatingWidgetIndex = DockContainerCount - 1;
-		for (int i = FloatingWidgetIndex; i < FloatingWidgets.count(); ++i)
-		{
-			CFloatingDockContainer* floatingWidget = FloatingWidgets[i];
-			if (!floatingWidget) continue;
-			// Use removeFromDockManager() (introduced in upstream commit 544c624) instead
-			// of removeDockContainer() so the container's back-pointer to the manager is
-			// cleared. Otherwise ~CDockContainerWidget() (called when deleteLater() fires)
-			// would try to remove this container a second time, tripping the
-			// Q_ASSERT(removed == 1) check in CDockManager::removeDockContainer().
-			floatingWidget->dockContainer()->removeFromDockManager();
-			floatingWidget->deleteLater();
-		}
+        // FloatingWidgets still contains windows waiting for deferred deletion.
+        // Select surplus windows from the current container registry instead.
+        const auto unusedContainers = Containers.mid(DockContainerCount);
+        for (auto *container : unusedContainers)
+        {
+            auto *floatingWidget = container->floatingWidget();
+            if (!floatingWidget)
+                continue;
+            container->removeFromDockManager();
+            floatingWidget->deleteLater();
+        }
+
     }
 
     return Result;

@@ -34,6 +34,41 @@ class PersistentPanelHostTest : public QObject
         QCOMPARE(QRect(area->mapFromGlobal(dock->mapToGlobal(QPoint())), dock->size()), area->contentAreaGeometry());
     }
 private slots:
+    void immediateFloatingRestoreKeepsNewContainersRegistered_data()
+    {
+        QTest::addColumn<bool>("prepared");
+        QTest::newRow("ordinary") << false;
+        QTest::newRow("prepared") << true;
+    }
+
+    void immediateFloatingRestoreKeepsNewContainersRegistered()
+    {
+        QFETCH(bool, prepared);
+        CDockManager manager;
+        manager.setPersistentDockWidgetHostsEnabled(true);
+        manager.setPreparedLayoutsEnabled(prepared);
+        auto *main = new CDockWidget("Main");
+        main->setWidget(new QLineEdit("Main content"));
+        manager.addDockWidget(LeftDockWidgetArea, main);
+        const auto docked = manager.saveState();
+        auto *floating = new CDockWidget("Floating");
+        QPointer<QWidget> content = new QLineEdit("Retained floating content");
+        floating->setWidget(content);
+        manager.addDockWidgetFloating(floating);
+        const auto withFloating = manager.saveState();
+        for (int i = 0; i < 3; ++i) {
+            QVERIFY(manager.restoreState(docked));
+            QVERIFY(manager.restoreState(withFloating));
+            QCOMPARE(manager.dockContainers().size(), 2);
+            QVERIFY(manager.dockContainers().contains(floating->dockContainer()));
+            QCOMPARE(floating->widget(), content.data());
+        }
+        settle();
+        QCOMPARE(manager.dockContainers().size(), 2);
+        QVERIFY(floating->dockContainer());
+        QCOMPARE(floating->widget(), content.data());
+    }
+
     void rootReplacementKeepsReusedSplittersPaintEnabled()
     {
         CDockManager manager;
