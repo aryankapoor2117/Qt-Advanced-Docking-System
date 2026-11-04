@@ -70,7 +70,11 @@ private:
 	friend struct DockManagerPrivate;
 	friend class CDockManager;
 	friend class CAutoHideDockContainer;
-	void onDockWidgetFeaturesChanged();
+    void prepareDockWidgets(const QList<CDockWidget*> &widgets, const QList<bool> &closed, int selected);
+    void refreshPersistentContent();
+    void detachPreparedTabs();
+    void bindPreparedTabs(const QList<bool> &closed, int selected);
+    void onDockWidgetFeaturesChanged();
 
 private Q_SLOTS:
 	void onTabCloseRequested(int Index);
@@ -320,6 +324,10 @@ public:
 	 */
     static bool restoreState(CDockingStateReader& Stream, CDockAreaWidget*& CreatedWidget,
 		bool Testing, CDockContainerWidget* ParentContainer);
+
+    /** Restore overload reporting whether an existing area was retained. */
+    static bool restoreState(CDockingStateReader& Stream, CDockAreaWidget*& CreatedWidget,
+        bool Testing, CDockContainerWidget* ParentContainer, bool* Reused);
 
 	/**
 	 * This functions returns the dock widget features of all dock widget in

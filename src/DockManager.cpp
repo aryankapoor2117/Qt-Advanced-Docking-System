@@ -1,3 +1,5 @@
+#include "LayoutSwitchTrace.h"
+#include "PreparedDockLayout.h"
 /*******************************************************************************
 ** Qt Advanced Docking System
 ** Copyright (C) 2017 Uwe Kindler
@@ -45,6 +47,7 @@
 #include <iostream>
 
 #include <QMainWindow>
+#include <QLayout>
 #include <QList>
 #include <QMap>
 #include <QVariant>
@@ -132,12 +135,21 @@ struct DockManagerPrivate
 	CDockOverlay* ContainerOverlay;
 	CDockOverlay* DockAreaOverlay;
 	QMap<QString, CDockWidget*> DockWidgetsMap;
+    QMap<QString, int> RestoreDestinations;
 	QMap<QString, QByteArray> Perspectives;
 	QMap<QString, QMenu*> ViewMenuGroups;
 	QMenu* ViewMenu;
 	CDockManager::eViewMenuInsertionOrder MenuInsertionOrder = CDockManager::MenuAlphabeticallySorted;
     CDockManager::ColorSchemeMode ColorSchemeMode = CDockManager::ColorSchemeMode::FollowPalette;
 	bool RestoringState = false;
+    bool PersistentDockWidgetHosts = false;
+    bool PreparedLayouts = false;
+    bool LastRestorePrepared = false;
+    bool LastRestoreBounds = false;
+    QMap<QByteArray, std::shared_ptr<PreparedDockLayout>> PreparedCache;
+    QByteArray ActivePreparedKey;
+    QByteArray ActivePreparedFingerprint;
+    quint64 PreparedGeneration = 0;
 	QVector<CFloatingDockContainer*> UninitializedFloatingWidgets;
 	CDockFocusController* FocusController = nullptr;
 	QString RestoredFocusedDockWidget;
@@ -291,6 +303,7 @@ bool DockManagerPrivate::restoreContainer(int Index, CDockingStateReader& stream
 //============================================================================
 bool DockManagerPrivate::checkFormat(const QByteArray &state, int version)
 {
+    const layout_trace::Span trace("qtads.validate_saved_xml");
     return restoreStateFromXml(state, version, internal::RestoreTesting);
 }
 
@@ -299,6 +312,7 @@ bool DockManagerPrivate::checkFormat(const QByteArray &state, int version)
 bool DockManagerPrivate::restoreStateFromXml(const QByteArray &state,  int version,
 	bool Testing)
 {
+    const layout_trace::Span trace(Testing ? "qtads.validate_xml_tree" : "qtads.apply_xml_tree");
 	Q_UNUSED(version);
 
     if (state.isEmpty())
@@ -380,20 +394,18 @@ bool DockManagerPrivate::restoreStateFromXml(const QByteArray &state,  int versi
 
     if (!Testing)
     {
-		// Delete remaining empty floating widgets
-		int FloatingWidgetIndex = DockContainerCount - 1;
-		for (int i = FloatingWidgetIndex; i < FloatingWidgets.count(); ++i)
-		{
-			CFloatingDockContainer* floatingWidget = FloatingWidgets[i];
-			if (!floatingWidget) continue;
-			// Use removeFromDockManager() (introduced in upstream commit 544c624) instead
-			// of removeDockContainer() so the container's back-pointer to the manager is
-			// cleared. Otherwise ~CDockContainerWidget() (called when deleteLater() fires)
-			// would try to remove this container a second time, tripping the
-			// Q_ASSERT(removed == 1) check in CDockManager::removeDockContainer().
-			floatingWidget->dockContainer()->removeFromDockManager();
-			floatingWidget->deleteLater();
-		}
+        // FloatingWidgets still contains windows waiting for deferred deletion.
+        // Select surplus windows from the current container registry instead.
+        const auto unusedContainers = Containers.mid(DockContainerCount);
+        for (auto *container : unusedContainers)
+        {
+            auto *floatingWidget = container->floatingWidget();
+            if (!floatingWidget)
+                continue;
+            container->removeFromDockManager();
+            floatingWidget->deleteLater();
+        }
+
     }
 
     return Result;
@@ -403,6 +415,7 @@ bool DockManagerPrivate::restoreStateFromXml(const QByteArray &state,  int versi
 //============================================================================
 void DockManagerPrivate::restoreDockWidgetsOpenState()
 {
+    const layout_trace::Span trace("qtads.restoreDockWidgetsOpenState");
     // All dock widgets, that have not been processed in the restore state
     // function are invisible to the user now and have no assigned dock area
     // They do not belong to any dock container, until the user toggles the
@@ -431,6 +444,7 @@ void DockManagerPrivate::restoreDockWidgetsOpenState()
 //============================================================================
 void DockManagerPrivate::restoreDockAreasIndices()
 {
+    const layout_trace::Span trace("qtads.restoreDockAreasIndices");
     // Now all dock areas are properly restored and we setup the index of
     // The dock areas because the previous toggleView() action has changed
     // the dock area index
@@ -468,6 +482,7 @@ void DockManagerPrivate::restoreDockAreasIndices()
 //============================================================================
 void DockManagerPrivate::emitTopLevelEvents()
 {
+    const layout_trace::Span trace("qtads.emitTopLevelEvents");
     // Finally we need to send the topLevelChanged() signals for all dock
     // widgets if top level changed
     for (auto DockContainer : Containers)
@@ -502,9 +517,37 @@ bool DockManagerPrivate::restoreState(const QByteArray& State, int version)
     	return false;
     }
 
+    // Resolve membership across every container before moving a live panel.
+    // A departing panel stays with its old group until its destination takes
+    // it, instead of entering an artificial unassigned/manager-owned state.
+    {
+        const layout_trace::Span trace("qtads.plan_panel_destinations");
+        CDockingStateReader plan(state);
+        int group = 0;
+        while (!plan.atEnd()) {
+            plan.readNext();
+            if (!plan.isStartElement())
+                continue;
+            if (plan.name() == QLatin1String("SideBar")
+                && !CDockManager::testAutoHideConfigFlag(CDockManager::AutoHideFeatureEnabled)) {
+                plan.skipCurrentElement();
+                continue;
+            }
+            if (plan.name() == QLatin1String("Area") || plan.name() == QLatin1String("SideBar"))
+                ++group;
+            else if (plan.name() == QLatin1String("Widget")) {
+                const auto name = plan.attributes().value("Name").toString();
+                if (DockWidgetsMap.contains(name))
+                    RestoreDestinations.insert(name, group);
+            }
+        }
+        if (plan.hasError())
+            return false;
+    }
+
     // Hide updates of floating widgets from use
-    hideFloatingWidgets();
-    markDockWidgetsDirty();
+    layout_trace::timed("qtads.hide_floating_windows", [&] { hideFloatingWidgets(); });
+    layout_trace::timed("qtads.mark_panels_dirty", [&] { markDockWidgetsDirty(); });
 
     if (!restoreStateFromXml(state, version))
     {
@@ -623,6 +666,7 @@ CDockManager::CDockManager(QWidget *parent) :
 //============================================================================
 CDockManager::~CDockManager()
 {
+    clearPreparedLayouts();
     // fix memory leaks, see https://github.com/githubuser0xFFFF/Qt-Advanced-Docking-System/issues/307
 	std::vector<QPointer<ads::CDockAreaWidget>> areas;
 	for (int i = 0; i != dockAreaCount(); ++i)
@@ -695,59 +739,30 @@ void CDockManager::setComponentsFactory(QSharedPointer<ads::CDockComponentsFacto
 bool CDockManager::eventFilter(QObject *obj, QEvent *e)
 {
 #if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
-	// Emulate Qt:Tool behaviour.
-	// Required because on some WMs Tool windows can't be maximized.
-
-	// Wayland: skip the stays-on-top emulation. The compositor owns the
-	// window stacking, and changing the window flags of a shown window
-	// recreates its surface, which would detach a running platform drag.
-	// The minimize synchronization below does not change window flags and
-	// is kept.
-
-	// Window always on top of the MainWindow.
-	if (!internal::isWayland() && e->type() == QEvent::WindowActivate)
-	{
-        for (auto _window : d->FloatingWidgets)
-		{
-			if (!_window->isVisible() || window()->isMinimized())
-			{
-				continue;
-			}
-			// setWindowFlags(Qt::WindowStaysOnTopHint) will hide the window and thus requires a show call.
-			// This then leads to flickering and a nasty endless loop (also buggy behaviour on Ubuntu).
-			// So we just do it ourself.
-            if(QGuiApplication::platformName() == QLatin1String("xcb"))
-			{
-				internal::xcb_update_prop(true, _window->window()->winId(),
-                    "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STAYS_ON_TOP");
-			}
-			else
-			{
-                    _window->setWindowFlag(Qt::WindowStaysOnTopHint, true);
-			}
+    // Only X11 needs tool-window stacking emulation. Changing window flags
+    // on offscreen/minimal hides the window; Wayland owns its stacking.
+    const bool emulateStacking = QGuiApplication::platformName() == QLatin1String("xcb");
+    if (emulateStacking && e->type() == QEvent::WindowActivate)
+    {
+        for (auto floating : d->FloatingWidgets)
+        {
+            if (!floating || !floating->isVisible() || window()->isMinimized())
+                continue;
+            internal::xcb_update_prop(true, floating->window()->winId(),
+                "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STAYS_ON_TOP");
         }
-	}
-	else if (!internal::isWayland() && e->type() == QEvent::WindowDeactivate)
-	{
-        for (auto _window : d->FloatingWidgets)
-		{
-			if (!_window->isVisible() || window()->isMinimized())
-			{
-				continue;
-			}
-
-            if(QGuiApplication::platformName() == QLatin1String("xcb"))
-			{
-				internal::xcb_update_prop(false, _window->window()->winId(),
-                    "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STAYS_ON_TOP");
-			}
-            else
-			{
-				_window->setWindowFlag(Qt::WindowStaysOnTopHint, false);
-			}
-			_window->raise();
-		}
-	}
+    }
+    else if (emulateStacking && e->type() == QEvent::WindowDeactivate)
+    {
+        for (auto floating : d->FloatingWidgets)
+        {
+            if (!floating || !floating->isVisible() || window()->isMinimized())
+                continue;
+            internal::xcb_update_prop(false, floating->window()->winId(),
+                "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STAYS_ON_TOP");
+            floating->raise();
+        }
+    }
 
 	// Sync minimize with MainWindow
 	if (e->type() == QEvent::WindowStateChange)
@@ -980,8 +995,104 @@ QByteArray CDockManager::saveState(int version) const
 
 
 //============================================================================
+bool CDockManager::hasRestoreDestination(const CDockWidget* widget) const
+{
+    return d->RestoringState && widget
+        && d->RestoreDestinations.contains(widget->objectName());
+}
+
+//============================================================================
+bool CDockManager::isStatePrepared(const QByteArray &state, int version) const
+{
+    auto prepared = d->PreparedCache.value(QByteArray::number(version) + ':' + state);
+    return prepared && prepared->valid();
+}
+
+CDockSplitter *CDockManager::preparedRootForState(const QByteArray &state, int version) const
+{
+    auto prepared = d->PreparedCache.value(QByteArray::number(version) + ':' + state);
+    return prepared && prepared->valid() ? prepared->root.data() : nullptr;
+}
+
+void CDockManager::retainPreparedStates(const QList<QByteArray> &states, int version)
+{
+    QSet<QByteArray> keep;
+    keep.insert(d->ActivePreparedKey);
+    for (const auto &state : states) keep.insert(QByteArray::number(version) + ':' + state);
+    for (auto it = d->PreparedCache.begin(); it != d->PreparedCache.end();) {
+        if (keep.contains(it.key())) { ++it; continue; }
+        auto obsolete = it.value();
+        it = d->PreparedCache.erase(it);
+        if (obsolete && obsolete->root && obsolete->root != rootSplitter()
+            && !rootSplitter()->isAncestorOf(obsolete->root)) obsolete->root->deleteLater();
+    }
+}
+
+bool CDockManager::prepareState(const QByteArray &state, int version)
+{
+    if (!d->PreparedLayouts || d->RestoringState) return false;
+    if (isStatePrepared(state, version)) return true;
+    const layout_trace::Span trace("qtads.prepare_bounds_layout");
+    const auto xml = state.startsWith("<?xml") ? state : qUncompress(state);
+    if (!d->checkFormat(xml, version)) return false;
+    auto prepared = compilePreparedLayout(xml);
+    if (!prepared) return false;
+    d->PreparedCache.insert(QByteArray::number(version) + ':' + state, prepared);
+    return true;
+}
+
+bool CDockManager::activatePreparedState(const QByteArray &state, int version)
+{
+    if (!d->PreparedLayouts || d->RestoringState || d->Containers.size() != 1
+        || !autoHideWidgets().isEmpty()) return false;
+    const auto key = QByteArray::number(version) + ':' + state;
+    auto target = d->PreparedCache.value(key);
+    auto outgoing = d->PreparedCache.value(d->ActivePreparedKey);
+    if (!target || !target->valid()) return false;
+    const bool outgoingUnchanged = outgoing && outgoing->matchesActive()
+        && outgoing->root == rootSplitter() && outgoing->areas.size() == dockAreaCount();
+    if (!outgoingUnchanged && target->root == rootSplitter()) return false;
+    QPointer<CDockSplitter> discarded;
+    if (!outgoingUnchanged) {
+        d->PreparedCache.remove(d->ActivePreparedKey);
+        discarded = rootSplitter();
+    }
+    const layout_trace::Span trace("qtads.activate_bounds_layout");
+    d->RestoringState = true;
+    Q_EMIT restoringState();
+    QSet<CDockWidget*> present, selected;
+    for (const auto &group : target->areas) {
+        for (auto dock : group.widgets) present.insert(dock);
+        if (group.selected >= 0 && !group.closed[group.selected])
+            selected.insert(group.widgets[group.selected]);
+    }
+    // Geometry is established with panel-slot reactions suspended. Surfaces
+    // selected in both arrangements never get an intermediate hide event.
+    const bool activated = activatePreparedBounds(*target);
+    Q_ASSERT(activated);
+    if (discarded) discarded->deleteLater();
+    for (auto *dock : d->DockWidgetsMap) {
+        if (!present.contains(dock)) {
+            dock->setClosedState(true);
+            dock->setToggleViewActionChecked(false);
+        }
+        if (!selected.contains(dock)) dock->hide();
+    }
+    d->ActivePreparedKey = key;
+    d->ActivePreparedFingerprint.clear();
+    ++d->PreparedGeneration;
+    d->LastRestorePrepared = true;
+    d->LastRestoreBounds = true;
+    d->RestoringState = false;
+    for (int i = 0; i < dockAreaCount(); ++i)
+        dockArea(i)->refreshPersistentContent();
+    Q_EMIT stateRestored();
+    return true;
+}
+
 bool CDockManager::restoreState(const QByteArray &state, int version)
 {
+    if (activatePreparedState(state, version)) return true;
 	// Prevent multiple calls as long as state is not restore. This may
 	// happen, if QApplication::processEvents() is called somewhere
 	if (d->RestoringState)
@@ -989,27 +1100,120 @@ bool CDockManager::restoreState(const QByteArray &state, int version)
 		return false;
 	}
 
-	// We hide the complete dock manager here. Restoring the state means
-	// that DockWidgets are removed from the DockArea internal stack layout
-	// which in turn  means, that each time a widget is removed the stack
-	// will show and raise the next available widget which in turn
-	// triggers show events for the dock widgets. To avoid this we hide the
-	// dock manager. Because there will be no processing of application
-	// events until this function is finished, the user will not see this
-	// hiding
-	bool IsHidden = this->isHidden();
-	if (!IsHidden)
-	{
-		hide();
-	}
+    // Preserve live native surfaces while reconciling the tree. Intermediate
+    // QWidget paints are batched rather than hiding/showing the whole manager.
+    const bool UpdatesWereEnabled = updatesEnabled();
+    if (UpdatesWereEnabled)
+        setUpdatesEnabled(false);
+    d->RestoreDestinations.clear();
 	d->RestoringState = true;
 	Q_EMIT restoringState();
-	bool Result = d->restoreState(state, version);
-	d->RestoringState = false;
-	if (!IsHidden)
-	{
-		show();
-	}
+    d->LastRestorePrepared = false;
+    d->LastRestoreBounds = false;
+    const QByteArray cacheKey = QByteArray::number(version) + ':' + state;
+    const bool singleContainer = d->Containers.size() == 1 && autoHideWidgets().isEmpty();
+    auto prepared = d->PreparedCache.value(cacheKey);
+    bool eligible = prepared && prepared->valid();
+    bool targetValid = true;
+    if (d->PreparedLayouts && !eligible) {
+        const auto xml = state.startsWith("<?xml") ? state : qUncompress(state);
+        targetValid = d->checkFormat(xml, version);
+        CDockingStateReader reader(xml);
+        if (reader.readNextStartElement())
+            eligible = reader.attributes().value("Containers").toInt() == 1;
+        while (!reader.atEnd() && eligible) {
+            reader.readNext();
+            if (reader.isStartElement() && reader.name() == QLatin1String("SideBar"))
+                eligible = false;
+        }
+        eligible = eligible && !reader.hasError();
+    }
+    if (targetValid && d->PreparedLayouts && singleContainer) {
+        const layout_trace::Span trace("qtads.park_prepared_layout");
+        if (!d->ActivePreparedKey.isEmpty()
+            && ((!d->ActivePreparedFingerprint.isEmpty()
+                    && saveState(version) == d->ActivePreparedFingerprint)
+                || (d->PreparedCache.value(d->ActivePreparedKey)
+                    && d->PreparedCache.value(d->ActivePreparedKey)->matchesActive()))) {
+            auto captured = capturePreparedLayout();
+            if (captured) {
+                auto obsolete = d->PreparedCache.value(d->ActivePreparedKey);
+                if (obsolete && obsolete->root && obsolete->root != captured->root
+                    && !rootSplitter()->isAncestorOf(obsolete->root))
+                    delete obsolete->root;
+                d->PreparedCache.insert(d->ActivePreparedKey, captured);
+                detachPreparedLayout();
+                // Keep retained chrome bounded; live panel instances are shared.
+                while (d->PreparedCache.size() > 32) {
+                    auto victim = d->PreparedCache.begin();
+                    while (victim != d->PreparedCache.end()
+                        && (victim.key() == cacheKey || victim.key() == d->ActivePreparedKey)) ++victim;
+                    if (victim == d->PreparedCache.end()) break;
+                    auto layout = victim.value();
+                    d->PreparedCache.erase(victim);
+                    if (layout && layout->root) layout->root->deleteLater();
+                }
+
+            }
+        } else {
+            if (d->ActivePreparedKey == cacheKey)
+                prepared.reset();
+            d->PreparedCache.remove(d->ActivePreparedKey);
+        }
+    }
+    d->ActivePreparedKey.clear();
+    d->ActivePreparedFingerprint.clear();
+    bool Result = false;
+    if (targetValid && d->PreparedLayouts && singleContainer && eligible && prepared && prepared->valid()) {
+        const layout_trace::Span trace("qtads.activate_prepared_layout");
+        // An uncached outgoing layout still needs detaching before activation.
+        if (dockAreaCount()) {
+            auto discarded = capturePreparedLayout();
+            detachPreparedLayout();
+            if (discarded && discarded->root) discarded->root->deleteLater();
+        }
+        QSet<CDockWidget*> selected;
+        QSet<CDockWidget*> present;
+        for (const auto &group : prepared->areas) {
+            for (auto dock : group.widgets) present.insert(dock);
+            if (group.selected >= 0 && !group.closed[group.selected])
+                selected.insert(group.widgets[group.selected]);
+        }
+        for (auto *dock : d->DockWidgetsMap) {
+            if (!present.contains(dock)) dock->flagAsUnassigned();
+            else if (!selected.contains(dock)) dock->hide();
+        }
+        Result = activatePreparedLayout(*prepared);
+        d->LastRestorePrepared = Result;
+        if (Result) d->emitTopLevelEvents();
+    }
+    if (!Result && targetValid)
+        Result = d->restoreState(state, version);
+    const auto generation = ++d->PreparedGeneration;
+    if (Result && d->PreparedLayouts && eligible && d->Containers.size() == 1) {
+        d->ActivePreparedKey = cacheKey;
+        // Capture after Wizard's toolbar/panel work and queued geometry settle.
+        QTimer::singleShot(0, this, [this, generation, version] {
+            if (d->PreparedGeneration == generation && !d->ActivePreparedKey.isEmpty())
+            {
+                d->ActivePreparedFingerprint = saveState(version);
+                auto prepared = capturePreparedLayout();
+                if (prepared) d->PreparedCache.insert(d->ActivePreparedKey, prepared);
+            }
+        });
+    }
+
+    d->RestoreDestinations.clear();
+    d->RestoringState = false;
+    if (d->PersistentDockWidgetHosts) {
+        layout()->activate();
+        for (auto *container : d->Containers) {
+            for (int i = 0; i < container->dockAreaCount(); ++i)
+                container->dockArea(i)->refreshPersistentContent();
+        }
+    }
+    if (UpdatesWereEnabled)
+        setUpdatesEnabled(true);
 	Q_EMIT stateRestored();
 	if (Result && !d->RestoredFocusedDockWidget.isEmpty())
 	{
@@ -1138,6 +1342,58 @@ void CDockManager::restoreHiddenFloatingWidgets()
 }
 
 //============================================================================
+void CDockManager::setPersistentDockWidgetHostsEnabled(bool enabled)
+{
+    Q_ASSERT_X(dockAreaCount() == 0, Q_FUNC_INFO, "Enable persistent hosts before creating dock areas");
+    if (dockAreaCount() == 0)
+        d->PersistentDockWidgetHosts = enabled;
+}
+
+bool CDockManager::persistentDockWidgetHostsEnabled() const
+{
+    return d->PersistentDockWidgetHosts;
+}
+
+void CDockManager::setPreparedLayoutsEnabled(bool enabled)
+{
+    Q_ASSERT(!enabled || persistentDockWidgetHostsEnabled());
+    d->PreparedLayouts = enabled && persistentDockWidgetHostsEnabled();
+    if (d->PreparedLayouts) enablePreparedLayoutStack();
+}
+
+bool CDockManager::preparedLayoutsEnabled() const { return d->PreparedLayouts; }
+bool CDockManager::lastRestoreUsedPreparedLayout() const { return d->LastRestorePrepared; }
+bool CDockManager::lastRestoreUsedBoundsActivation() const { return d->LastRestoreBounds; }
+
+void CDockManager::clearPreparedLayouts()
+{
+    QSet<CDockSplitter*> obsolete;
+    for (const auto &entry : d->PreparedCache)
+        if (entry && entry->root && entry->root != rootSplitter()
+            && !rootSplitter()->isAncestorOf(entry->root))
+            obsolete.insert(entry->root);
+    d->PreparedCache.clear();
+    d->ActivePreparedKey.clear();
+    d->ActivePreparedFingerprint.clear();
+    ++d->PreparedGeneration;
+    // Cached tabs reference shared docks; dispose of their chrome while those
+    // docks are still alive, before removal or manager teardown.
+    for (auto *root : obsolete) delete root;
+}
+
+
+void CDockManager::registerDockWidget(CDockWidget* Dockwidget)
+{
+    Q_ASSERT(Dockwidget && !Dockwidget->dockAreaWidget());
+    if (d->DockWidgetsMap.value(Dockwidget->objectName()) == Dockwidget)
+        return;
+    d->DockWidgetsMap.insert(Dockwidget->objectName(), Dockwidget);
+    Dockwidget->setDockManager(this);
+    Dockwidget->flagAsUnassigned();
+    Q_EMIT dockWidgetAdded(Dockwidget);
+}
+
+//============================================================================
 CDockAreaWidget* CDockManager::addDockWidget(DockWidgetArea area,
 	CDockWidget* Dockwidget, CDockAreaWidget* DockAreaWidget, int Index)
 {
@@ -1210,6 +1466,7 @@ CDockWidget* CDockManager::findDockWidget(const QString& ObjectName) const
 //============================================================================
 void CDockManager::removeDockWidget(CDockWidget* Dockwidget)
 {
+    clearPreparedLayouts();
 	Q_EMIT dockWidgetAboutToBeRemoved(Dockwidget);
 	d->DockWidgetsMap.remove(Dockwidget->objectName());
 	CDockContainerWidget::removeDockWidget(Dockwidget);

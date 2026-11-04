@@ -1,3 +1,4 @@
+#include "LayoutSwitchTrace.h"
 /*******************************************************************************
 ** Qt Advanced Docking System
 ** Copyright (C) 2017 Uwe Kindler
@@ -78,7 +79,8 @@ struct DockWidgetPrivate
 	CDockWidget* _this = nullptr;
 	QBoxLayout* Layout = nullptr;
 	QWidget* Widget = nullptr;
-	CDockWidgetTab* TabWidget = nullptr;
+	QPointer<CDockWidgetTab> TabWidget;
+    QIcon Icon;
 	CDockWidget::DockWidgetFeatures Features = CDockWidget::DefaultDockWidgetFeatures;
 	QPointer<CDockManager> DockManager;
 	QPointer<CDockAreaWidget> DockArea;
@@ -513,7 +515,8 @@ CDockWidgetTab* CDockWidget::tabWidget() const
 {
 	if (!d->TabWidget)
 	{
-		d->TabWidget = d->componentsFactory()->createDockWidgetTab(const_cast<CDockWidget*>(this));
+        d->TabWidget = d->componentsFactory()->createDockWidgetTab(const_cast<CDockWidget*>(this));
+        if (!d->Icon.isNull()) d->TabWidget->setIcon(d->Icon);
 	}
 	return d->TabWidget;
 }
@@ -786,6 +789,8 @@ void CDockWidget::toggleView(bool Open)
 //============================================================================
 void CDockWidget::toggleViewInternal(bool Open)
 {
+    const layout_trace::Span trace("qtads.toggle_panel", layout_trace::currentId()
+        ? QJsonObject{{"dock", objectName()}, {"open", Open}} : QJsonObject{});
 	CDockContainerWidget* DockContainer = dockContainer();
 	CDockWidget* TopLevelDockWidgetBefore = DockContainer
 		? DockContainer->topLevelDockWidget() : nullptr;
@@ -841,11 +846,32 @@ void CDockWidget::toggleViewInternal(bool Open)
 
 
 //============================================================================
+void CDockWidget::setPreparedTabWidget(CDockWidgetTab *tab)
+{
+    if (d->TabWidget == tab) return;
+    // Detached, uncached tabs are owned by the panel itself.
+    if (d->TabWidget && d->TabWidget->parentWidget() == this)
+        d->TabWidget->deleteLater();
+    d->TabWidget = tab;
+    if (tab) {
+        if (tab->text() != windowTitle()) tab->setText(windowTitle());
+        if (tab->icon().cacheKey() != d->Icon.cacheKey()) tab->setIcon(d->Icon);
+    }
+}
+
+//============================================================================
 void CDockWidget::setDockArea(CDockAreaWidget* DockArea)
 {
+    const layout_trace::Span trace("qtads.panel.reparent");
 	d->DockArea = DockArea;
 	d->ToggleViewAction->setChecked(DockArea != nullptr && !this->isClosed());
-	setParent(DockArea);
+    QWidget *host = DockArea;
+    if (d->DockManager && d->DockManager->persistentDockWidgetHostsEnabled())
+        host = DockArea && DockArea->dockContainer()
+            ? static_cast<QWidget*>(DockArea->dockContainer())
+            : static_cast<QWidget*>(d->DockManager);
+    if (parentWidget() != host)
+        setParent(host);
 }
 
 
@@ -862,11 +888,16 @@ void CDockWidget::saveState(QXmlStreamWriter& s) const
 //============================================================================
 void CDockWidget::flagAsUnassigned()
 {
+    const layout_trace::Span trace("qtads.panel.unassign");
 	d->Closed = true;
 	setVisible(false);
-	setDockArea(nullptr);
-	setParent(d->DockManager);
-	tabWidget()->setParent(this);
+    // Clear logical ownership without briefly making a native dock a top-level
+    // window. Genuinely absent panels park directly under the manager once.
+    d->DockArea = nullptr;
+    d->ToggleViewAction->setChecked(false);
+    layout_trace::timed("qtads.panel.park_at_manager", [&] { setParent(d->DockManager); });
+    if (!d->DockManager->preparedLayoutsEnabled())
+        tabWidget()->setParent(this);
 }
 
 
@@ -943,6 +974,7 @@ void CDockWidget::setTabToolTip(const QString &text)
 //============================================================================
 void CDockWidget::setIcon(const QIcon& Icon)
 {
+    d->Icon = Icon;
 	tabWidget()->setIcon(Icon);
 
 	if (d->SideTabWidget)
@@ -960,7 +992,7 @@ void CDockWidget::setIcon(const QIcon& Icon)
 //============================================================================
 QIcon CDockWidget::icon() const
 {
-	return tabWidget()->icon();
+	return d->Icon;
 }
 
 
@@ -1202,8 +1234,7 @@ bool CDockWidget::closeDockWidgetInternal(bool ForceClose)
 		// delete the floating widget
 		if (isFloating())
 		{
-			CFloatingDockContainer* FloatingWidget = internal::findParent<
-					CFloatingDockContainer*>(this);
+			CFloatingDockContainer* FloatingWidget = floatingDockContainer();
 			if (FloatingWidget->dockWidgets().count() == 1)
 			{
 				FloatingWidget->deleteLater();

@@ -93,6 +93,7 @@ protected:
      * value.
      */
     void setDockArea(CDockAreaWidget* DockArea);
+    void setPreparedTabWidget(CDockWidgetTab *tab);
 
     /**
      * This function changes the toggle view action without emitting any
