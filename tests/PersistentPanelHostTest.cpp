@@ -69,6 +69,30 @@ private slots:
         QCOMPARE(floating->widget(), content.data());
     }
 
+    void activationChangesPreserveFloatingWindows()
+    {
+        CDockManager manager;
+        manager.setPersistentDockWidgetHostsEnabled(true);
+        auto *main = new CDockWidget("Main");
+        main->setWidget(new QLineEdit("Main"));
+        manager.addDockWidget(LeftDockWidgetArea, main);
+        auto *dock = new CDockWidget("Floating");
+        dock->setWidget(new QLineEdit("Floating"));
+        manager.resize(1200, 800);
+        manager.show();
+        QPointer<CFloatingDockContainer> floating = manager.addDockWidgetFloating(dock);
+        settle();
+        QVERIFY(floating && floating->isVisible());
+        const auto flags = floating->windowFlags();
+        for (auto type : {QEvent::WindowActivate, QEvent::WindowDeactivate}) {
+            QEvent event(type);
+            QCoreApplication::sendEvent(manager.window(), &event);
+            settle();
+            QVERIFY(floating && floating->isVisible());
+            QCOMPARE(floating->windowFlags(), flags);
+        }
+    }
+
     void restoredFloatingPanelsRemainVisible_data()
     {
         QTest::addColumn<bool>("prepared");

@@ -739,59 +739,30 @@ void CDockManager::setComponentsFactory(QSharedPointer<ads::CDockComponentsFacto
 bool CDockManager::eventFilter(QObject *obj, QEvent *e)
 {
 #if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
-	// Emulate Qt:Tool behaviour.
-	// Required because on some WMs Tool windows can't be maximized.
-
-	// Wayland: skip the stays-on-top emulation. The compositor owns the
-	// window stacking, and changing the window flags of a shown window
-	// recreates its surface, which would detach a running platform drag.
-	// The minimize synchronization below does not change window flags and
-	// is kept.
-
-	// Window always on top of the MainWindow.
-	if (!internal::isWayland() && e->type() == QEvent::WindowActivate)
-	{
-        for (auto _window : d->FloatingWidgets)
-		{
-			if (!_window->isVisible() || window()->isMinimized())
-			{
-				continue;
-			}
-			// setWindowFlags(Qt::WindowStaysOnTopHint) will hide the window and thus requires a show call.
-			// This then leads to flickering and a nasty endless loop (also buggy behaviour on Ubuntu).
-			// So we just do it ourself.
-            if(QGuiApplication::platformName() == QLatin1String("xcb"))
-			{
-				internal::xcb_update_prop(true, _window->window()->winId(),
-                    "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STAYS_ON_TOP");
-			}
-			else
-			{
-                    _window->setWindowFlag(Qt::WindowStaysOnTopHint, true);
-			}
+    // Only X11 needs tool-window stacking emulation. Changing window flags
+    // on offscreen/minimal hides the window; Wayland owns its stacking.
+    const bool emulateStacking = QGuiApplication::platformName() == QLatin1String("xcb");
+    if (emulateStacking && e->type() == QEvent::WindowActivate)
+    {
+        for (auto floating : d->FloatingWidgets)
+        {
+            if (!floating || !floating->isVisible() || window()->isMinimized())
+                continue;
+            internal::xcb_update_prop(true, floating->window()->winId(),
+                "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STAYS_ON_TOP");
         }
-	}
-	else if (!internal::isWayland() && e->type() == QEvent::WindowDeactivate)
-	{
-        for (auto _window : d->FloatingWidgets)
-		{
-			if (!_window->isVisible() || window()->isMinimized())
-			{
-				continue;
-			}
-
-            if(QGuiApplication::platformName() == QLatin1String("xcb"))
-			{
-				internal::xcb_update_prop(false, _window->window()->winId(),
-                    "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STAYS_ON_TOP");
-			}
-            else
-			{
-				_window->setWindowFlag(Qt::WindowStaysOnTopHint, false);
-			}
-			_window->raise();
-		}
-	}
+    }
+    else if (emulateStacking && e->type() == QEvent::WindowDeactivate)
+    {
+        for (auto floating : d->FloatingWidgets)
+        {
+            if (!floating || !floating->isVisible() || window()->isMinimized())
+                continue;
+            internal::xcb_update_prop(false, floating->window()->winId(),
+                "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STAYS_ON_TOP");
+            floating->raise();
+        }
+    }
 
 	// Sync minimize with MainWindow
 	if (e->type() == QEvent::WindowStateChange)
@@ -1244,13 +1215,6 @@ bool CDockManager::restoreState(const QByteArray &state, int version)
     if (UpdatesWereEnabled)
         setUpdatesEnabled(true);
 	Q_EMIT stateRestored();
-    if (Result && isVisible()) {
-        for (auto *container : d->Containers) {
-            auto *floating = container->floatingWidget();
-            if (floating && !container->openedDockAreas().isEmpty())
-                floating->show();
-        }
-    }
 	if (Result && !d->RestoredFocusedDockWidget.isEmpty())
 	{
 		if (auto DockWidget = findDockWidget(d->RestoredFocusedDockWidget))
