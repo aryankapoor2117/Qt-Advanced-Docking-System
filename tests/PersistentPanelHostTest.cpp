@@ -69,6 +69,42 @@ private slots:
         QCOMPARE(floating->widget(), content.data());
     }
 
+    void restoredFloatingPanelsRemainVisible_data()
+    {
+        QTest::addColumn<bool>("prepared");
+        QTest::newRow("ordinary") << false;
+        QTest::newRow("prepared") << true;
+    }
+
+    void restoredFloatingPanelsRemainVisible()
+    {
+        QFETCH(bool, prepared);
+        CDockManager manager;
+        manager.setPersistentDockWidgetHostsEnabled(true);
+        manager.setPreparedLayoutsEnabled(prepared);
+        auto *main = new CDockWidget("Main");
+        main->setWidget(new QLineEdit("Main"));
+        auto *area = manager.addDockWidget(LeftDockWidgetArea, main);
+        auto *dock = new CDockWidget("Floating");
+        QPointer<QWidget> content = new QLineEdit("Retained floating content");
+        dock->setWidget(content);
+        manager.resize(1200, 800);
+        manager.show();
+        manager.addDockWidgetFloating(dock);
+        settle();
+        QVERIFY(dock->floatingDockContainer()->isVisible());
+        const auto state = manager.saveState();
+        manager.addDockWidget(RightDockWidgetArea, dock, area);
+        settle();
+        QVERIFY(manager.restoreState(state));
+        settle();
+        QVERIFY(dock->isInFloatingContainer());
+        QTRY_VERIFY(dock->floatingDockContainer()->isVisible());
+        QTRY_VERIFY(content->isVisible());
+        QCOMPARE(dock->widget(), content.data());
+        verifyBounds(dock);
+    }
+
     void rootReplacementKeepsReusedSplittersPaintEnabled()
     {
         CDockManager manager;

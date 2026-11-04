@@ -1244,6 +1244,13 @@ bool CDockManager::restoreState(const QByteArray &state, int version)
     if (UpdatesWereEnabled)
         setUpdatesEnabled(true);
 	Q_EMIT stateRestored();
+    if (Result && isVisible()) {
+        for (auto *container : d->Containers) {
+            auto *floating = container->floatingWidget();
+            if (floating && !container->openedDockAreas().isEmpty())
+                floating->show();
+        }
+    }
 	if (Result && !d->RestoredFocusedDockWidget.isEmpty())
 	{
 		if (auto DockWidget = findDockWidget(d->RestoredFocusedDockWidget))
