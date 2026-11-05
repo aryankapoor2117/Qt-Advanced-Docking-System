@@ -1059,6 +1059,13 @@ void DockContainerWidgetPrivate::addDockAreasToList(const QList<CDockAreaWidget*
 	// likely hidden. We need to ensure, that it is visible
 	for (auto DockArea : NewDockAreas)
 	{
+        if (DockManager->persistentDockWidgetHostsEnabled()) {
+            // Inactive panels live beside the area in the old container too.
+            // Transfer every owner before the floating container is deleted.
+            for (auto *dock : DockArea->dockWidgets())
+                dock->setDockArea(DockArea);
+            DockArea->refreshPersistentContent();
+        }
 		DockArea->titleBarButton(TitleBarButtonClose)->setVisible(true);
 		DockArea->titleBarButton(TitleBarButtonAutoHide)->setVisible(true);
 		DockArea->titleBarButton(TitleBarButtonUndock)->setVisible(true);
