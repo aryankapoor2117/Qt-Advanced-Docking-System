@@ -9,6 +9,7 @@
 #include "DockWidgetTab.h"
 #include "DockSplitter.h"
 #include "FloatingDockContainer.h"
+#include "DockOverlay.h"
 
 using namespace ads;
 
@@ -34,6 +35,75 @@ class PersistentPanelHostTest : public QObject
         QCOMPARE(QRect(area->mapFromGlobal(dock->mapToGlobal(QPoint())), dock->size()), area->contentAreaGeometry());
     }
 private slots:
+    void floatingGroup_redockPreservesInactivePanel_data()
+    {
+        QTest::addColumn<bool>("persistentHosts");
+        QTest::newRow("ordinary-hosts") << false;
+        QTest::newRow("persistent-hosts") << true;
+    }
+
+    void floatingGroup_redockPreservesInactivePanel()
+    {
+        using namespace ads;
+        QFETCH(bool, persistentHosts);
+        struct ConfigRestorer {
+            CDockManager::ConfigFlags flags = CDockManager::configFlags();
+            ~ConfigRestorer() { CDockManager::setConfigFlags(flags); }
+        } restoreConfig;
+        CDockManager::setConfigFlag(CDockManager::HalfPanelDropZones, true);
+        class TestManager : public CDockManager {
+        public:
+            using CDockManager::containerOverlay;
+            using CDockContainerWidget::dropFloatingWidget;
+            using CDockManager::dockAreaOverlay;
+        } manager;
+        manager.setPersistentDockWidgetHostsEnabled(persistentHosts);
+        manager.resize(800, 600);
+        manager.show();
+        auto makePanel = [&manager](const QString &name) {
+            auto *dock = new CDockWidget(&manager, name);
+            dock->setWidget(new QLineEdit(name));
+            return dock;
+        };
+        auto *anchor = makePanel(QStringLiteral("Anchor"));
+        manager.addDockWidget(CenterDockWidgetArea, anchor);
+        QPointer<CDockWidget> graph = makePanel(QStringLiteral("Render Graph"));
+        QPointer<CDockWidget> mixer = makePanel(QStringLiteral("Mixer"));
+        QPointer<CFloatingDockContainer> floating = manager.addDockWidgetFloating(graph);
+        auto *area = graph->dockAreaWidget();
+        manager.addDockWidgetTabToArea(mixer, area);
+        area->setCurrentDockWidget(mixer);
+        floating->resize(500, 400);
+        floating->show();
+        QCoreApplication::processEvents();
+        QCOMPARE(area->currentDockWidget(), mixer.data());
+
+        const QPoint drop = manager.mapToGlobal(QPoint(2, manager.height() / 2));
+        manager.containerOverlay()->setAllowedAreas(LeftDockWidgetArea);
+        manager.containerOverlay()->showOverlay(&manager, drop);
+        manager.dockAreaOverlay()->hideOverlay();
+        manager.dropFloatingWidget(floating, drop);
+        QCOMPARE(area->dockContainer(), static_cast<CDockContainerWidget *>(&manager));
+        if (persistentHosts) {
+            QCOMPARE(graph->parentWidget(), static_cast<QWidget *>(&manager));
+            QCOMPARE(mixer->parentWidget(), static_cast<QWidget *>(&manager));
+        }
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCoreApplication::processEvents();
+        QVERIFY(!floating);
+        QVERIFY(graph);
+        QVERIFY(mixer);
+        QCOMPARE(area->dockWidgetsCount(), 2);
+        QCOMPARE(area->titleBar()->tabBar()->count(), 2);
+        QVERIFY(graph->tabWidget()->isVisible());
+        QVERIFY(mixer->tabWidget()->isVisible());
+        area->setCurrentDockWidget(graph);
+        QVERIFY(graph->isVisible());
+        area->setCurrentDockWidget(mixer);
+        QVERIFY(mixer->isVisible());
+        QVERIFY(area->features().testFlag(CDockWidget::DockWidgetMovable));
+    }
+
     void immediateFloatingRestoreKeepsNewContainersRegistered_data()
     {
         QTest::addColumn<bool>("prepared");
