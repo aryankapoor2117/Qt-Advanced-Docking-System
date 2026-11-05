@@ -1060,8 +1060,6 @@ void DockContainerWidgetPrivate::addDockAreasToList(const QList<CDockAreaWidget*
 	for (auto DockArea : NewDockAreas)
 	{
         if (DockManager->persistentDockWidgetHostsEnabled()) {
-            // Inactive panels live beside the area in the old container too.
-            // Transfer every owner before the floating container is deleted.
             for (auto *dock : DockArea->dockWidgets())
                 dock->setDockArea(DockArea);
             DockArea->refreshPersistentContent();

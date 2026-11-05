@@ -85,8 +85,6 @@ private slots:
         manager.dropFloatingWidget(floating, drop);
         QCOMPARE(area->dockContainer(), static_cast<CDockContainerWidget *>(&manager));
         if (persistentHosts) {
-            // Both panels must leave the retiring floating host, not only
-            // the currently selected Mixer surface.
             QCOMPARE(graph->parentWidget(), static_cast<QWidget *>(&manager));
             QCOMPARE(mixer->parentWidget(), static_cast<QWidget *>(&manager));
         }
