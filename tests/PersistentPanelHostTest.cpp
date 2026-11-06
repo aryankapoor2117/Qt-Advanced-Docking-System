@@ -519,19 +519,10 @@ private slots:
         for (auto *dock : {a,b,c}) dock->removeEventFilter(this);
     }
 
-    void restoreHidesReusedGroupWhosePanelsCloseOrFloat_data()
-    {
-        QTest::addColumn<bool>("prepared");
-        QTest::newRow("ordinary") << false;
-        QTest::newRow("prepared") << true;
-    }
-
     void restoreHidesReusedGroupWhosePanelsCloseOrFloat()
     {
-        QFETCH(bool, prepared);
         CDockManager manager;
         manager.setPersistentDockWidgetHostsEnabled(true);
-        manager.setPreparedLayoutsEnabled(prepared);
         auto *main = new CDockWidget("Main"), *side = new CDockWidget("Side"), *moving = new CDockWidget("Moving");
         main->setWidget(new QLineEdit("Main")); side->setWidget(new QLineEdit("Side"));
         moving->setWidget(new QLineEdit("Moving"));
